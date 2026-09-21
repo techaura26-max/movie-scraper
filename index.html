@@ -6,6 +6,7 @@
 <meta name="referrer" content="no-referrer">
 <title>Stream</title>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js"></script>
+<script src="https://cdn.dashjs.org/v4.7.3/dash.all.min.js"></script>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body { width: 100%; height: 100%; background: #000; font-family: system-ui, sans-serif; color: #fff; overflow: hidden; }
@@ -143,19 +144,52 @@ if (!id) {
     .then(function(r) { return r.json(); })
     .then(function(d) {
       if (d.error) return showErr(d.error);
-      play(d.url, d.type);
+      play(d.url, d.type, d.proxyToken);
     })
     .catch(function(err) { showErr(err.message); });
 }
 
-function play(rawUrl, type) {
+function makeProxyUrl(rawUrl, token) {
+  if (rawUrl.indexOf('/api?url=') === 0 || rawUrl.indexOf(location.origin + '/api?url=') === 0) {
+    return rawUrl;
+  }
+  return '/api?url=' + encodeURIComponent(rawUrl) + (token ? '&token=' + encodeURIComponent(token) : '');
+}
+
+function play(rawUrl, type, proxyToken) {
   if (!rawUrl) return showErr('No playable URL returned');
 
-  var proxySrc = '/api?url=' + encodeURIComponent(rawUrl);
+  var proxySrc = makeProxyUrl(rawUrl, proxyToken);
   var v = document.getElementById('v');
   var isHls = type === 'hls' || (!type && /\.m3u8?(?:\?|$)/i.test(rawUrl));
 
-  if (isHls && Hls.isSupported()) {
+  if (type === 'dash') {
+    if (!window.dashjs) return showErr('DASH player failed to load');
+
+    var dashPlayer = dashjs.MediaPlayer().create();
+    dashPlayer.extend('RequestModifier', function() {
+      return {
+        modifyRequestHeader: function(xhr) {
+          return xhr;
+        },
+        modifyRequestURL: function(url) {
+          return makeProxyUrl(url, proxyToken);
+        }
+      };
+    }, true);
+
+    v.addEventListener('canplay', function() {
+      showPlayer();
+      v.play().catch(function() {});
+    }, { once: true });
+
+    dashPlayer.on(dashjs.MediaPlayer.events.ERROR, function(event) {
+      var detail = event && (event.message || event.error || event.event);
+      showErr(detail ? String(detail) : 'DASH playback failed');
+    });
+
+    dashPlayer.initialize(v, rawUrl, true);
+  } else if (isHls && Hls.isSupported()) {
     var hls = new Hls({ enableWorker: true });
     hls.loadSource(proxySrc);
     hls.attachMedia(v);

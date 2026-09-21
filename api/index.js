@@ -49,7 +49,12 @@ async function getStream(id, season, episode) {
     : `https://vidlink.pro/api/b/movie/${token}?multiLang=0`;
 
   const res = await fetch(apiUrl, {
-    headers: { Referer: REFERER, Origin: ORIGIN, 'User-Agent': UA }
+    headers: {
+      Referer: REFERER,
+      Origin: ORIGIN,
+      'User-Agent': UA,
+      'x-playback-environment': 'webkit'
+    }
   });
   if (!res.ok) throw new Error(`vidlink API returned ${res.status}`);
   const data = await res.json();
@@ -57,9 +62,23 @@ async function getStream(id, season, episode) {
 
   if (!stream) throw new Error('No stream in response');
 
-  // Older VidLink responses expose an HLS playlist directly.
+  // The browser playback path returns DASH with a short-lived CloudFront
+  // cookie. Older VidLink responses may still expose HLS here.
   if (typeof stream.playlist === 'string' && stream.playlist) {
-    return { url: stream.playlist, type: 'hls' };
+    const isDash = stream.type === 'dash' || /\.mpd(?:\?|$)/i.test(stream.playlist);
+    const cookie = stream.playlistHeaders?.Cookie || stream.playlistHeaders?.cookie;
+    const resolutions = stream.playbackMetadata?.resolutions || [];
+    const quality = resolutions
+      .map(value => Number.parseInt(value, 10) || 0)
+      .sort((a, b) => b - a)[0] || null;
+
+    return {
+      url: stream.playlist,
+      type: isDash ? 'dash' : 'hls',
+      quality: quality ? String(quality) : null,
+      codec: stream.playbackMetadata?.codecName || null,
+      proxyToken: cookie ? Buffer.from(cookie, 'utf8').toString('base64url') : null
+    };
   }
 
   // Newer responses expose one or more direct video files by quality.
@@ -116,7 +135,11 @@ function fetchUpstream(url, requestHeaders = {}, redirects = 0) {
   });
 }
 
-function rewriteM3u8(body, url) {
+function proxyUrl(url, token) {
+  return '/api?url=' + encodeURIComponent(url) + (token ? '&token=' + encodeURIComponent(token) : '');
+}
+
+function rewriteM3u8(body, url, token) {
   const base = url.split('?')[0];
   const baseDir = base.substring(0, base.lastIndexOf('/') + 1);
   const origin = new URL(url).origin;
@@ -124,8 +147,22 @@ function rewriteM3u8(body, url) {
     const t = line.trim();
     if (!t || t.startsWith('#')) return line;
     const abs = t.startsWith('http') ? t : t.startsWith('/') ? origin + t : baseDir + t;
-    return '/api?url=' + encodeURIComponent(abs);
+    return proxyUrl(abs, token);
   }).join('\n');
+}
+
+function rewriteMpd(body, url) {
+  if (/<BaseURL\b/i.test(body)) return body;
+
+  const baseDir = new URL('.', url).href;
+  const escapedBaseDir = baseDir
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+
+  return body.replace(/(<MPD\b[^>]*>)/i, `$1\n<BaseURL>${escapedBaseDir}</BaseURL>`);
 }
 
 // ── Vercel serverless handler ─────────────────────────────────────────────────
@@ -143,17 +180,33 @@ module.exports = async function handler(req, res) {
     try {
       const requestHeaders = {};
       if (req.headers?.range) requestHeaders.Range = req.headers.range;
+      if (q.token) {
+        const cookie = Buffer.from(q.token, 'base64url').toString('utf8');
+        if (cookie.length > 4096 || /[\r\n]/.test(cookie) || !cookie.includes('CloudFront-')) {
+          throw new Error('invalid playback token');
+        }
+        requestHeaders.Cookie = cookie;
+      }
 
       const upstream = await fetchUpstream(url, requestHeaders);
       const ct = (upstream.headers['content-type'] || '').toLowerCase();
       const isM3u8 = ct.includes('mpegurl') || ct.includes('m3u8') || /\.m3u8?(\?|$)/i.test(url.split('?')[0]);
+      const isMpd = ct.includes('dash+xml') || /\.mpd(?:\?|$)/i.test(url.split('?')[0]);
 
-      if (isM3u8) {
+      if (isM3u8 && upstream.statusCode >= 200 && upstream.statusCode < 300) {
         const chunks = [];
         for await (const chunk of upstream) chunks.push(chunk);
         const body = Buffer.concat(chunks).toString('utf8');
+        res.statusCode = upstream.statusCode;
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-        return res.end(rewriteM3u8(body, url));
+        return res.end(rewriteM3u8(body, url, q.token));
+      } else if (isMpd && upstream.statusCode >= 200 && upstream.statusCode < 300) {
+        const chunks = [];
+        for await (const chunk of upstream) chunks.push(chunk);
+        const body = Buffer.concat(chunks).toString('utf8');
+        res.statusCode = upstream.statusCode;
+        res.setHeader('Content-Type', 'application/dash+xml');
+        return res.end(rewriteMpd(body, url));
       } else {
         res.setHeader('Content-Type', ct || 'application/octet-stream');
         for (const header of ['content-length', 'content-range', 'accept-ranges', 'cache-control', 'etag', 'last-modified']) {
