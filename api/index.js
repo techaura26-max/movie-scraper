@@ -53,21 +53,63 @@ async function getStream(id, season, episode) {
   });
   if (!res.ok) throw new Error(`vidlink API returned ${res.status}`);
   const data = await res.json();
-  const playlist = data?.stream?.playlist;
-  if (!playlist) throw new Error('No playlist in response');
-  return playlist;
+  const stream = data?.stream;
+
+  if (!stream) throw new Error('No stream in response');
+
+  // Older VidLink responses expose an HLS playlist directly.
+  if (typeof stream.playlist === 'string' && stream.playlist) {
+    return { url: stream.playlist, type: 'hls' };
+  }
+
+  // Newer responses expose one or more direct video files by quality.
+  if (stream.qualities && typeof stream.qualities === 'object') {
+    const sources = Object.entries(stream.qualities)
+      .filter(([, source]) => source && typeof source.url === 'string' && source.url)
+      .sort(([qualityA], [qualityB]) => {
+        const a = Number.parseInt(qualityA, 10) || 0;
+        const b = Number.parseInt(qualityB, 10) || 0;
+        return b - a;
+      });
+
+    if (sources.length) {
+      const [quality, source] = sources[0];
+      return {
+        url: source.url,
+        type: source.type === 'hls' || /\.m3u8?(?:\?|$)/i.test(source.url) ? 'hls' : 'video',
+        quality,
+        codec: source.codecName || null
+      };
+    }
+  }
+
+  throw new Error('No playable source in response');
 }
 
-// ── HLS upstream fetcher with redirect support ────────────────────────────────
-function fetchUpstream(url, redirects = 0) {
+// ── Upstream fetcher with redirect and byte-range support ─────────────────────
+function fetchUpstream(url, requestHeaders = {}, redirects = 0) {
   return new Promise((resolve, reject) => {
     if (redirects > 5) return reject(new Error('too many redirects'));
-    (url.startsWith('https') ? https : http).get(url, {
-      headers: { Referer: REFERER, Origin: ORIGIN, 'User-Agent': UA, Accept: '*/*' }
+    const parsedUrl = new URL(url);
+    if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+      return reject(new Error('unsupported upstream protocol'));
+    }
+
+    const client = parsedUrl.protocol === 'https:' ? https : http;
+    client.get(parsedUrl, {
+      headers: {
+        Referer: REFERER,
+        Origin: ORIGIN,
+        'User-Agent': UA,
+        Accept: '*/*',
+        ...requestHeaders
+      }
     }, res => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         const loc = res.headers.location;
-        return resolve(fetchUpstream(loc.startsWith('http') ? loc : new URL(loc, url).href, redirects + 1));
+        res.resume();
+        const nextUrl = loc.startsWith('http') ? loc : new URL(loc, parsedUrl).href;
+        return resolve(fetchUpstream(nextUrl, requestHeaders, redirects + 1));
       }
       resolve(res);
     }).on('error', reject);
@@ -89,15 +131,20 @@ function rewriteM3u8(body, url) {
 // ── Vercel serverless handler ─────────────────────────────────────────────────
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
 
   const { searchParams } = new URL(req.url, 'http://localhost');
   const q = Object.fromEntries(searchParams);
 
   // Proxy mode: /api?url=...
   if (q.url) {
-    const url = decodeURIComponent(q.url);
+    // URLSearchParams already decodes the query value once.
+    const url = q.url;
     try {
-      const upstream = await fetchUpstream(url);
+      const requestHeaders = {};
+      if (req.headers?.range) requestHeaders.Range = req.headers.range;
+
+      const upstream = await fetchUpstream(url, requestHeaders);
       const ct = (upstream.headers['content-type'] || '').toLowerCase();
       const isM3u8 = ct.includes('mpegurl') || ct.includes('m3u8') || /\.m3u8?(\?|$)/i.test(url.split('?')[0]);
 
@@ -109,7 +156,9 @@ module.exports = async function handler(req, res) {
         return res.end(rewriteM3u8(body, url));
       } else {
         res.setHeader('Content-Type', ct || 'application/octet-stream');
-        if (upstream.headers['content-length']) res.setHeader('Content-Length', upstream.headers['content-length']);
+        for (const header of ['content-length', 'content-range', 'accept-ranges', 'cache-control', 'etag', 'last-modified']) {
+          if (upstream.headers[header]) res.setHeader(header, upstream.headers[header]);
+        }
         res.statusCode = upstream.statusCode;
         upstream.pipe(res);
       }
@@ -129,8 +178,8 @@ module.exports = async function handler(req, res) {
 
   res.setHeader('Content-Type', 'application/json');
   try {
-    const url = await getStream(q.id, q.s, q.e);
-    res.end(JSON.stringify({ url }));
+    const stream = await getStream(q.id, q.s, q.e);
+    res.end(JSON.stringify(stream));
   } catch (err) {
     res.statusCode = 500;
     res.end(JSON.stringify({ error: err.message }));

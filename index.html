@@ -142,15 +142,19 @@ if (!id) {
     .then(function(r) { return r.json(); })
     .then(function(d) {
       if (d.error) return showErr(d.error);
-      play(d.url);
+      play(d.url, d.type);
     })
     .catch(function(err) { showErr(err.message); });
 }
 
-function play(rawUrl) {
+function play(rawUrl, type) {
+  if (!rawUrl) return showErr('No playable URL returned');
+
   var src = '/api?url=' + encodeURIComponent(rawUrl);
   var v = document.getElementById('v');
-  if (Hls.isSupported()) {
+  var isHls = type === 'hls' || (!type && /\.m3u8?(?:\?|$)/i.test(rawUrl));
+
+  if (isHls && Hls.isSupported()) {
     var hls = new Hls({ enableWorker: true });
     hls.loadSource(src);
     hls.attachMedia(v);
@@ -163,8 +167,13 @@ function play(rawUrl) {
     });
   } else {
     v.src = src;
-    v.addEventListener('canplay', showPlayer, { once: true });
-    v.play().catch(function(err) { showErr(err.message); });
+    v.addEventListener('canplay', function() {
+      showPlayer();
+      v.play().catch(function() {});
+    }, { once: true });
+    v.addEventListener('error', function() {
+      showErr('Video playback failed');
+    }, { once: true });
   }
 }
 </script>
