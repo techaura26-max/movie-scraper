@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
 <title>Stream</title>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js"></script>
 <style>
@@ -150,13 +151,13 @@ if (!id) {
 function play(rawUrl, type) {
   if (!rawUrl) return showErr('No playable URL returned');
 
-  var src = '/api?url=' + encodeURIComponent(rawUrl);
+  var proxySrc = '/api?url=' + encodeURIComponent(rawUrl);
   var v = document.getElementById('v');
   var isHls = type === 'hls' || (!type && /\.m3u8?(?:\?|$)/i.test(rawUrl));
 
   if (isHls && Hls.isSupported()) {
     var hls = new Hls({ enableWorker: true });
-    hls.loadSource(src);
+    hls.loadSource(proxySrc);
     hls.attachMedia(v);
     hls.on(Hls.Events.MANIFEST_PARSED, function() {
       showPlayer();
@@ -166,14 +167,29 @@ function play(rawUrl, type) {
       if (d.fatal) showErr(d.details || 'HLS fatal error');
     });
   } else {
-    v.src = src;
+    var triedProxy = false;
+
+    // Direct MP4 playback avoids shared Vercel IP rate limits from the video CDN.
+    // A media element can play a cross-origin file without exposing it to JS.
+    v.referrerPolicy = 'no-referrer';
+    v.src = isHls ? proxySrc : rawUrl;
+
     v.addEventListener('canplay', function() {
       showPlayer();
       v.play().catch(function() {});
     }, { once: true });
-    v.addEventListener('error', function() {
+
+    v.addEventListener('error', function onVideoError() {
+      if (!isHls && !triedProxy) {
+        triedProxy = true;
+        v.src = proxySrc;
+        v.load();
+        return;
+      }
+
+      v.removeEventListener('error', onVideoError);
       showErr('Video playback failed');
-    }, { once: true });
+    });
   }
 }
 </script>
